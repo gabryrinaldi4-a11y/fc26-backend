@@ -36,8 +36,11 @@ app.get('/api/health', function(req, res) {
 
 // ─── Receive prices from Chrome Extension ───
 app.post('/api/update-prices', function(req, res) {
+  console.log('[update-prices] Received body:', JSON.stringify(req.body).substring(0, 300));
+
   var players = req.body.players;
   if (!players || !Array.isArray(players)) {
+    console.log('[update-prices] ERROR: no players array');
     return res.status(400).json({ error: 'players array required' });
   }
 
