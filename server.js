@@ -4,366 +4,200 @@ var fetch = require('node-fetch');
 
 var app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
-var cache = {};
-var CACHE_TTL = 600000;
+// ─────────────────────────────────────────────
+// PRICE STORAGE — populated by Chrome Extension
+// ─────────────────────────────────────────────
+var priceDb = {};
+// Format: priceDb["158023"] = { ps: 245000, xbox: 210000, pc: 198000, updatedAt: 123456, isReal: true, name: "Messi" }
 
-var HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  'Accept': 'application/json',
-  'Referer': 'https://fut.gg/',
+var stats = {
+  totalReceived: 0,
+  lastUpdateTime: 0,
+  updatesCount: 0,
 };
 
-function extractPrice(data, id) {
-  if (!data) return 0;
-  if (data[id] && data[id].price) return data[id].price;
-  if (data[id] && data[id].lowest_bin) return data[id].lowest_bin;
-  if (data.prices && data.prices[id]) return data.prices[id];
-  if (data.data && Array.isArray(data.data)) {
-    for (var i = 0; i < data.data.length; i++) {
-      var item = data.data[i];
-      if (String(item.player_id) === String(id) || String(item.id) === String(id)) {
-        return item.price || item.lowest_bin || item.lowest_price || 0;
-      }
-    }
-  }
-  if (data.data && data.data[id]) {
-    var d = data.data[id];
-    return d.price || d.lowest_bin || d.lowest_price || 0;
-  }
-  var keys = Object.keys(data);
-  for (var j = 0; j < keys.length; j++) {
-    var val = data[keys[j]];
-    if (val && typeof val === 'object' && (val.price || val.lowest_bin)) {
-      return val.price || val.lowest_bin || 0;
-    }
-  }
-  return 0;
-}
+// ─────────────────────────────────────────────
+// ENDPOINTS
+// ─────────────────────────────────────────────
 
-function fetchPlatformPrice(id, platform) {
-  var url = 'https://fut.gg/api/fut/player-prices/?player_ids=' + id + '&platform=' + platform;
-  return fetch(url, { headers: HEADERS })
-    .then(function(r) {
-      if (!r.ok) return null;
-      return r.json();
-    })
-    .then(function(data) {
-      if (!data) return 0;
-      return extractPrice(data, id);
-    })
-    .catch(function() {
-      return 0;
-    });
-}
-
-// Health
+// Health check
 app.get('/api/health', function(req, res) {
   res.json({
     status: 'ok',
-    cached: Object.keys(cache).length,
+    cached: Object.keys(priceDb).length,
     uptime: Math.floor(process.uptime()),
+    totalReceived: stats.totalReceived,
+    lastUpdateTime: stats.lastUpdateTime,
+    updatesCount: stats.updatesCount,
   });
 });
 
-// ─────────────────────────────────────────────
-// TEST 1: Cerca Mbappe su fut.gg — mostra risposta raw
-// ─────────────────────────────────────────────
-app.get('/api/test', function(req, res) {
-  var url = 'https://fut.gg/api/fut/players/?search=Mbappe&game=fc26';
-
-  fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'application/json',
-      'Referer': 'https://fut.gg/',
-    }
-  })
-    .then(function(r) {
-      return r.text();
-    })
-    .then(function(text) {
-      res.type('text/plain').send(text);
-    })
-    .catch(function(err) {
-      res.status(500).json({ error: err.message });
-    });
-});
-
-// ─────────────────────────────────────────────
-// TEST 2: Prova diversi formati URL di fut.gg
-// ─────────────────────────────────────────────
-app.get('/api/test2', function(req, res) {
-  var urls = [
-    'https://fut.gg/api/fut/players/?search=Mbappe',
-    'https://fut.gg/api/fut/players/?search=Mbappe&game=fc26',
-    'https://fut.gg/api/players/?search=Mbappe&game=fc26',
-    'https://fut.gg/en/players/?search=Mbappe',
-    'https://fut.gg/api/fut/player-prices/?player_ids=231747&platform=ps4',
-    'https://fut.gg/api/fut/player-prices/?player_ids=231747&platform=console',
-    'https://fut.gg/api/fut/player-prices/?player_ids=231747',
-  ];
-
-  var results = {};
-
-  var promises = urls.map(function(url) {
-    return fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-        'Referer': 'https://fut.gg/',
-      }
-    })
-      .then(function(r) {
-        results[url] = { status: r.status, contentType: r.headers.get('content-type') };
-        return r.text();
-      })
-      .then(function(text) {
-        results[url].bodyLength = text.length;
-        results[url].body = text.substring(0, 1000);
-        // prova a parsare come JSON per mostrare le chiavi
-        try {
-          var json = JSON.parse(text);
-          results[url].isJson = true;
-          results[url].topKeys = Object.keys(json).slice(0, 10);
-          if (json.data) {
-            results[url].dataType = typeof json.data;
-            if (Array.isArray(json.data)) {
-              results[url].dataLength = json.data.length;
-              if (json.data[0]) {
-                results[url].firstItemKeys = Object.keys(json.data[0]);
-                results[url].firstItem = JSON.stringify(json.data[0]).substring(0, 500);
-              }
-            } else if (typeof json.data === 'object') {
-              results[url].dataKeys = Object.keys(json.data).slice(0, 10);
-            }
-          }
-          if (json.results && Array.isArray(json.results) && json.results[0]) {
-            results[url].firstResultKeys = Object.keys(json.results[0]);
-            results[url].firstResult = JSON.stringify(json.results[0]).substring(0, 500);
-          }
-        } catch(e) {
-          results[url].isJson = false;
-          results[url].isHtml = text.substring(0, 20).indexOf('<') >= 0;
-        }
-      })
-      .catch(function(err) {
-        results[url] = { error: err.message };
-      });
-  });
-
-  Promise.all(promises).then(function() {
-    res.json(results);
-  });
-});
-
-// ─────────────────────────────────────────────
-// TEST 3: Prova a cercare il prezzo con l'ID dell'API msmc.cc
-// ─────────────────────────────────────────────
-app.get('/api/test3', function(req, res) {
-  var id = req.query.id || '231747'; // Mbappe default
-  var name = req.query.name || 'Mbappe';
-
-  var urls = [
-    'https://fut.gg/api/fut/player-prices/?player_ids=' + id + '&platform=ps4',
-    'https://fut.gg/api/fut/player-prices/?player_ids=' + id + '&platform=console',
-    'https://fut.gg/api/fut/player-prices/?player_ids=' + id,
-    'https://fut.gg/api/fut/players/?search=' + encodeURIComponent(name),
-    'https://fut.gg/api/fut/players/?search=' + encodeURIComponent(name) + '&game=fc26',
-  ];
-
-  var results = {};
-
-  var promises = urls.map(function(url) {
-    return fetch(url, { headers: HEADERS })
-      .then(function(r) {
-        results[url] = { status: r.status };
-        return r.text();
-      })
-      .then(function(text) {
-        results[url].bodyLength = text.length;
-        try {
-          var json = JSON.parse(text);
-          results[url].parsed = json;
-        } catch(e) {
-          results[url].rawStart = text.substring(0, 300);
-        }
-      })
-      .catch(function(err) {
-        results[url] = { error: err.message };
-      });
-  });
-
-  Promise.all(promises).then(function() {
-    res.json(results);
-  });
-});
-
-// Prezzo singolo
-app.get('/api/price/:id', function(req, res) {
-  var id = req.params.id;
-
-  if (cache[id] && Date.now() - cache[id].updatedAt < CACHE_TTL) {
-    return res.json(cache[id]);
+// ─── Receive prices from Chrome Extension ───
+app.post('/api/update-prices', function(req, res) {
+  var players = req.body.players;
+  if (!players || !Array.isArray(players)) {
+    return res.status(400).json({ error: 'players array required' });
   }
 
-  Promise.all([
-    fetchPlatformPrice(id, 'ps4'),
-    fetchPlatformPrice(id, 'xboxone'),
-    fetchPlatformPrice(id, 'pc'),
-  ])
-    .then(function(prices) {
-      var result = {
-        ps: prices[0] || 0,
-        xbox: prices[1] || 0,
-        pc: prices[2] || 0,
-        updatedAt: Date.now(),
-        isReal: (prices[0] > 0 || prices[1] > 0 || prices[2] > 0),
+  var saved = 0;
+  for (var i = 0; i < players.length; i++) {
+    var p = players[i];
+    if (p.futbinId) {
+      priceDb[p.futbinId] = {
+        ps: p.pricePs || 0,
+        xbox: p.priceXbox || 0,
+        pc: p.pricePc || 0,
+        updatedAt: p.updatedAt || Date.now(),
+        isReal: true,
+        name: p.name || '',
+        ovr: p.ovr || 0,
+        cardType: p.cardType || '',
+        club: p.club || '',
+        league: p.league || '',
+        nation: p.nation || '',
       };
-      if (result.isReal) {
-        cache[id] = result;
-      }
-      res.json(result);
-    })
-    .catch(function(err) {
-      if (cache[id]) {
-        return res.json(cache[id]);
-      }
-      res.status(500).json({ error: err.message });
-    });
+      saved++;
+    }
+  }
+
+  stats.totalReceived += saved;
+  stats.lastUpdateTime = Date.now();
+  stats.updatesCount++;
+
+  console.log('[update] Received ' + saved + ' prices. Total in DB: ' + Object.keys(priceDb).length);
+
+  res.json({ ok: true, saved: saved, totalInDb: Object.keys(priceDb).length });
 });
 
-// Batch prezzi
+// ─── Get all prices ───
+app.get('/api/prices/all', function(req, res) {
+  res.json(priceDb);
+});
+
+// ─── Get single price by FUTBIN ID ───
+app.get('/api/price/:id', function(req, res) {
+  var id = req.params.id;
+  var data = priceDb[id];
+
+  if (data) {
+    res.json(data);
+  } else {
+    res.status(404).json({ error: 'Price not found for ID ' + id, isReal: false });
+  }
+});
+
+// ─── Batch prices by IDs ───
 app.post('/api/prices/batch', function(req, res) {
   var ids = req.body.ids;
   if (!Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ error: 'Need ids array' });
   }
 
-  var list = ids.slice(0, 50);
   var results = {};
-  var toFetch = [];
-
-  for (var i = 0; i < list.length; i++) {
-    var id = String(list[i]);
-    if (cache[id] && Date.now() - cache[id].updatedAt < CACHE_TTL) {
-      results[id] = cache[id];
-    } else {
-      toFetch.push(id);
+  for (var i = 0; i < ids.length; i++) {
+    var id = String(ids[i]);
+    if (priceDb[id]) {
+      results[id] = priceDb[id];
     }
   }
 
-  if (toFetch.length === 0) {
-    return res.json(results);
-  }
-
-  var chunks = [];
-  for (var j = 0; j < toFetch.length; j += 5) {
-    chunks.push(toFetch.slice(j, j + 5));
-  }
-
-  function doChunk(idx) {
-    if (idx >= chunks.length) return Promise.resolve();
-
-    var promises = chunks[idx].map(function(id) {
-      return Promise.all([
-        fetchPlatformPrice(id, 'ps4'),
-        fetchPlatformPrice(id, 'xboxone'),
-        fetchPlatformPrice(id, 'pc'),
-      ]).then(function(prices) {
-        var result = {
-          ps: prices[0] || 0,
-          xbox: prices[1] || 0,
-          pc: prices[2] || 0,
-          updatedAt: Date.now(),
-          isReal: (prices[0] > 0 || prices[1] > 0 || prices[2] > 0),
-        };
-        if (result.isReal) cache[id] = result;
-        results[id] = result;
-      }).catch(function() {
-        if (cache[id]) results[id] = cache[id];
-      });
-    });
-
-    return Promise.all(promises).then(function() {
-      if (idx + 1 < chunks.length) {
-        return new Promise(function(resolve) {
-          setTimeout(resolve, 300);
-        }).then(function() {
-          return doChunk(idx + 1);
-        });
-      }
-    });
-  }
-
-  doChunk(0).then(function() {
-    res.json(results);
-  });
+  res.json(results);
 });
 
-// Cerca giocatore
+// ─── Search prices by name ───
 app.get('/api/search', function(req, res) {
-  var name = (req.query.name || '').toString().trim();
-  if (!name) return res.status(400).json({ error: 'Need name param' });
+  var name = (req.query.name || '').toString().trim().toLowerCase();
+  if (!name) {
+    return res.status(400).json({ error: 'Need name param' });
+  }
 
-  var url = 'https://fut.gg/api/fut/players/?search=' + encodeURIComponent(name);
-  fetch(url, { headers: HEADERS })
-    .then(function(r) {
-      if (!r.ok) throw new Error('fut.gg search ' + r.status);
-      return r.json();
-    })
-    .then(function(data) {
-      var players = [];
-      var items = data.data || data.results || data;
-      if (Array.isArray(items)) {
-        for (var i = 0; i < Math.min(items.length, 20); i++) {
-          var p = items[i];
-          players.push({
-            id: String(p.id || p.player_id || p.ea_id || ''),
-            name: p.name || p.common_name || p.known_as || '',
-            rating: p.rating || p.overall || p.ovr || 0,
-            position: p.position || '',
-            club: p.club || p.team || '',
-            nation: p.nation || p.nationality || '',
-          });
-        }
-      }
-      res.json({ players: players, query: name, count: players.length });
-    })
-    .catch(function(err) {
-      res.status(502).json({ error: err.message });
-    });
+  var results = [];
+  var keys = Object.keys(priceDb);
+  for (var i = 0; i < keys.length; i++) {
+    var entry = priceDb[keys[i]];
+    if (entry.name && entry.name.toLowerCase().indexOf(name) >= 0) {
+      results.push({
+        futbinId: keys[i],
+        name: entry.name,
+        ps: entry.ps,
+        xbox: entry.xbox,
+        pc: entry.pc,
+        ovr: entry.ovr,
+        cardType: entry.cardType,
+        updatedAt: entry.updatedAt,
+      });
+    }
+    if (results.length >= 20) break;
+  }
+
+  res.json({ players: results, query: name, count: results.length });
+});
+
+// ─── Stats ───
+app.get('/api/stats', function(req, res) {
+  var totalPlayers = Object.keys(priceDb).length;
+  var withPsPrice = 0;
+  var withXboxPrice = 0;
+  var withPcPrice = 0;
+  var oldest = Date.now();
+  var newest = 0;
+
+  var keys = Object.keys(priceDb);
+  for (var i = 0; i < keys.length; i++) {
+    var entry = priceDb[keys[i]];
+    if (entry.ps > 0) withPsPrice++;
+    if (entry.xbox > 0) withXboxPrice++;
+    if (entry.pc > 0) withPcPrice++;
+    if (entry.updatedAt < oldest) oldest = entry.updatedAt;
+    if (entry.updatedAt > newest) newest = entry.updatedAt;
+  }
+
+  res.json({
+    totalPlayers: totalPlayers,
+    withPsPrice: withPsPrice,
+    withXboxPrice: withXboxPrice,
+    withPcPrice: withPcPrice,
+    oldestUpdate: oldest < Date.now() ? oldest : null,
+    newestUpdate: newest > 0 ? newest : null,
+    totalReceived: stats.totalReceived,
+    updatesCount: stats.updatesCount,
+    lastUpdateTime: stats.lastUpdateTime,
+  });
 });
 
 // Root
 app.get('/', function(req, res) {
   res.json({
     name: 'FC26 Market Proxy',
-    version: '2.1.0',
-    source: 'fut.gg',
+    version: '3.0.0',
+    source: 'Chrome Extension + FUTBIN',
+    playersInDb: Object.keys(priceDb).length,
     endpoints: {
       health: 'GET /api/health',
-      price: 'GET /api/price/:id',
+      price: 'GET /api/price/:futbinId',
       batch: 'POST /api/prices/batch { ids: [...] }',
-      search: 'GET /api/search?name=Mbappé',
-      test: 'GET /api/test — raw fut.gg search response',
-      test2: 'GET /api/test2 — try multiple URL formats',
-      test3: 'GET /api/test3?id=231747&name=Mbappe — test specific player',
+      search: 'GET /api/search?name=Mbappe',
+      all: 'GET /api/prices/all',
+      update: 'POST /api/update-prices { players: [...] }',
+      stats: 'GET /api/stats',
     },
   });
 });
 
+// Start
 var PORT = process.env.PORT || 3001;
 app.listen(PORT, function() {
-  console.log('FC26 Market Proxy v2.1 on port ' + PORT);
+  console.log('FC26 Market Proxy v3.0 on port ' + PORT);
+  console.log('Waiting for Chrome Extension to send prices...');
   console.log('');
   console.log('Endpoints:');
   console.log('  GET  /api/health');
   console.log('  GET  /api/price/:id');
   console.log('  POST /api/prices/batch');
   console.log('  GET  /api/search?name=...');
-  console.log('  GET  /api/test');
-  console.log('  GET  /api/test2');
-  console.log('  GET  /api/test3?id=231747&name=Mbappe');
+  console.log('  GET  /api/prices/all');
+  console.log('  POST /api/update-prices');
+  console.log('  GET  /api/stats');
 });
