@@ -1,6 +1,7 @@
 var express = require('express');
 var cors = require('cors');
 var fetch = require('node-fetch');
+var fs = require('fs');
 
 var app = express();
 app.use(cors());
@@ -10,6 +11,7 @@ app.use(express.json({ limit: '5mb' }));
 // PRICE STORAGE — populated by Chrome Extension
 // ─────────────────────────────────────────────
 var priceDb = {};
+var CACHE_FILE = './prices-cache.json';
 // Format: priceDb["158023"] = { ps: 245000, xbox: 210000, pc: 198000, updatedAt: 123456, isReal: true, name: "Messi" }
 
 var stats = {
@@ -17,6 +19,37 @@ var stats = {
   lastUpdateTime: 0,
   updatesCount: 0,
 };
+
+function loadCacheFromFile() {
+  try {
+    if (fs.existsSync(CACHE_FILE)) {
+      var data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+      Object.keys(data).forEach(function(id) {
+        priceDb[id] = data[id];
+      });
+      console.log('✅ Cache caricata: ' + Object.keys(priceDb).length + ' prezzi');
+    } else {
+      console.log('ℹ️ Nessun file cache trovato, avvio con DB vuoto');
+    }
+  } catch (err) {
+    console.error('Errore caricamento cache:', err.message);
+  }
+}
+
+function saveCacheToFile() {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(priceDb), 'utf8');
+    console.log('💾 Salvati: ' + Object.keys(priceDb).length + ' prezzi');
+  } catch (err) {
+    console.error('Errore salvataggio:', err.message);
+  }
+}
+
+// Carica cache all'avvio
+loadCacheFromFile();
+
+// Salva automaticamente ogni 5 minuti
+setInterval(saveCacheToFile, 5 * 60 * 1000);
 
 // ─────────────────────────────────────────────
 // ENDPOINTS
@@ -68,6 +101,9 @@ app.post('/api/update-prices', function(req, res) {
   stats.totalReceived += saved;
   stats.lastUpdateTime = Date.now();
   stats.updatesCount++;
+
+  // Salva subito dopo ogni aggiornamento prezzi
+  saveCacheToFile();
 
   console.log('[update] Received ' + saved + ' prices. Total in DB: ' + Object.keys(priceDb).length);
 
@@ -174,9 +210,10 @@ app.get('/api/stats', function(req, res) {
 app.get('/', function(req, res) {
   res.json({
     name: 'FC26 Market Proxy',
-    version: '3.0.0',
+    version: '3.1.0',
     source: 'Chrome Extension + FUTBIN',
     playersInDb: Object.keys(priceDb).length,
+    cacheFile: CACHE_FILE,
     endpoints: {
       health: 'GET /api/health',
       price: 'GET /api/price/:futbinId',
@@ -192,8 +229,9 @@ app.get('/', function(req, res) {
 // Start
 var PORT = process.env.PORT || 3001;
 app.listen(PORT, function() {
-  console.log('FC26 Market Proxy v3.0 on port ' + PORT);
+  console.log('FC26 Market Proxy v3.1 on port ' + PORT);
   console.log('Waiting for Chrome Extension to send prices...');
+  console.log('Cache file: ' + CACHE_FILE);
   console.log('');
   console.log('Endpoints:');
   console.log('  GET  /api/health');
