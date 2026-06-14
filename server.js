@@ -1,43 +1,134 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const tough = require('tough-cookie');
+const fetchCookie = require('fetch-cookie');
 
 // ─────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minuti
+const CACHE_TTL_MS = 10 * 60 * 1000;
 const FUTBIN_PRICE_URL = 'https://www.futbin.com/25/playerPrices';
 const FUTBIN_PLAYERS_URL = 'https://www.futbin.com/25/players';
+const FUTBIN_HOME = 'https://www.futbin.com/';
 
-// Headers che simulano Chrome reale — FUTBIN blocca i bot senza questi
-const BROWSER_HEADERS = {
-  'User-Agent':
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  Accept: 'application/json, text/plain, */*',
-  'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
-  'Accept-Encoding': 'gzip, deflate, br',
-  Referer: 'https://www.futbin.com/',
-  Origin: 'https://www.futbin.com',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-origin',
-  'Sec-CH-UA': '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
-  'Sec-CH-UA-Mobile': '?0',
-  'Sec-CH-UA-Platform': '"Windows"',
-};
+// ─────────────────────────────────────────────
+// COOKIE JAR — mantiene i cookie di sessione FUTBIN
+// ─────────────────────────────────────────────
+const cookieJar = new tough.CookieJar();
+const fetchWithCookies = fetchCookie(fetch, cookieJar);
+
+// ─────────────────────────────────────────────
+// USER-AGENT ROTATION
+// ─────────────────────────────────────────────
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+];
+
+function getRandomUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// Headers freschi per ogni richiesta (UA diverso ogni volta)
+function getBrowserHeaders() {
+  return {
+    'User-Agent': getRandomUA(),
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9,it;q=0.8,fr;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Referer': 'https://www.futbin.com/',
+    'Origin': 'https://www.futbin.com',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+  };
+}
+
+// ─────────────────────────────────────────────
+// SESSIONE FUTBIN — visita la homepage per prendere cookie
+// ─────────────────────────────────────────────
+let sessionReady = false;
+let sessionInitTime = 0;
+const SESSION_MAX_AGE = 30 * 60 * 1000; // rinnova sessione ogni 30 min
+
+async function initSession() {
+  try {
+    console.log('[session] Inizializzazione sessione FUTBIN...');
+    await fetchWithCookies(FUTBIN_HOME, {
+      headers: getBrowserHeaders(),
+      redirect: 'follow',
+      timeout: 15000,
+    });
+    sessionReady = true;
+    sessionInitTime = Date.now();
+    const cookies = cookieJar.getCookieStringSync(FUTBIN_HOME);
+    console.log(`[session] ✅ Sessione FUTBIN inizializzata (cookies: ${cookies ? 'sì' : 'no'})`);
+  } catch (err) {
+    console.error('[session] ❌ Errore init sessione:', err.message);
+    sessionReady = false;
+  }
+}
+
+// Rinnova la sessione se scaduta
+async function ensureSession() {
+  if (!sessionReady || Date.now() - sessionInitTime > SESSION_MAX_AGE) {
+    await initSession();
+  }
+}
+
+// ─────────────────────────────────────────────
+// FETCH WRAPPER — usa cookie jar + headers rotanti
+// ─────────────────────────────────────────────
+async function futbinFetch(url) {
+  await ensureSession();
+
+  const res = await fetchWithCookies(url, {
+    headers: getBrowserHeaders(),
+    redirect: 'follow',
+    timeout: 12000,
+  });
+
+  // Se 403, rinnova sessione e riprova una volta
+  if (res.status === 403) {
+    console.log('[fetch] 403 ricevuto, rinnovo sessione e riprovo...');
+    await initSession();
+
+    const retry = await fetchWithCookies(url, {
+      headers: getBrowserHeaders(),
+      redirect: 'follow',
+      timeout: 12000,
+    });
+
+    return retry;
+  }
+
+  return res;
+}
 
 // ─────────────────────────────────────────────
 // CACHE
 // ─────────────────────────────────────────────
-const priceCache = new Map();   // futbinId → { data, ts }
-const searchCache = new Map();  // nameLower → { data, ts }
+const priceCache = new Map();
+const searchCache = new Map();
 
 function cacheGet(map, key) {
   const entry = map.get(key);
   if (!entry) return null;
   if (Date.now() - entry.ts > CACHE_TTL_MS) {
-    // Scaduto — ma lo teniamo come "stale" fallback
     return { data: entry.data, stale: true };
   }
   return { data: entry.data, stale: false };
@@ -48,7 +139,7 @@ function cacheSet(map, key, data) {
 }
 
 // ─────────────────────────────────────────────
-// PARSE PREZZO FUTBIN
+// PARSE PREZZO
 // ─────────────────────────────────────────────
 function parsePrice(raw) {
   if (!raw || raw === '0' || raw === 'N/A' || raw === '---') return 0;
@@ -59,14 +150,11 @@ function parsePrice(raw) {
 }
 
 // ─────────────────────────────────────────────
-// FETCH SINGOLO PREZZO DA FUTBIN
+// FETCH PREZZO SINGOLO
 // ─────────────────────────────────────────────
 async function fetchPriceFromFutbin(futbinId) {
   const url = `${FUTBIN_PRICE_URL}?player=${futbinId}`;
-  const res = await fetch(url, {
-    headers: BROWSER_HEADERS,
-    timeout: 12000,
-  });
+  const res = await futbinFetch(url);
 
   if (!res.ok) {
     throw new Error(`FUTBIN ${res.status} per player ${futbinId}`);
@@ -80,13 +168,12 @@ async function fetchPriceFromFutbin(futbinId) {
   }
 
   return {
-    ps:   parsePrice(entry.prices.ps?.LCPrice),
+    ps: parsePrice(entry.prices.ps?.LCPrice),
     xbox: parsePrice(entry.prices.xbox?.LCPrice),
-    pc:   parsePrice(entry.prices.pc?.LCPrice),
-    // Anche i prezzi BIN (Buy-It-Now) se presenti
-    ps_bin:   parsePrice(entry.prices.ps?.BINPrice),
+    pc: parsePrice(entry.prices.pc?.LCPrice),
+    ps_bin: parsePrice(entry.prices.ps?.BINPrice),
     xbox_bin: parsePrice(entry.prices.xbox?.BINPrice),
-    pc_bin:   parsePrice(entry.prices.pc?.BINPrice),
+    pc_bin: parsePrice(entry.prices.pc?.BINPrice),
     updatedAt: Date.now(),
     futbinId: String(futbinId),
     isReal: true,
@@ -94,22 +181,20 @@ async function fetchPriceFromFutbin(futbinId) {
 }
 
 // ─────────────────────────────────────────────
-// APP EXPRESS
+// EXPRESS APP
 // ─────────────────────────────────────────────
 const app = express();
-
-// CORS aperto a qualsiasi origine
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '1mb' }));
 
-// Rate limiting semplice per non abusare di FUTBIN
+// Rate limit
 let requestsThisMinute = 0;
 setInterval(() => { requestsThisMinute = 0; }, 60000);
-const MAX_REQUESTS_PER_MINUTE = 60;
+const MAX_RPM = 60;
 
-function rateLimitCheck(res) {
-  if (requestsThisMinute >= MAX_REQUESTS_PER_MINUTE) {
-    res.status(429).json({ error: 'Troppi richieste, riprova tra un minuto' });
+function checkRate(res) {
+  if (requestsThisMinute >= MAX_RPM) {
+    res.status(429).json({ error: 'Rate limit: riprova tra un minuto' });
     return false;
   }
   requestsThisMinute++;
@@ -117,66 +202,51 @@ function rateLimitCheck(res) {
 }
 
 // ─────────────────────────────────────────────
-// ENDPOINT: Health check
+// ENDPOINTS
 // ─────────────────────────────────────────────
+
+// Health
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
+    session: sessionReady,
     cachedPrices: priceCache.size,
     cachedSearches: searchCache.size,
     uptime: Math.floor(process.uptime()),
-    requestsThisMinute,
+    rpm: requestsThisMinute,
   });
 });
 
-// ─────────────────────────────────────────────
-// ENDPOINT: GET /api/price/:id
-// Prezzo singolo per ID FUTBIN
-// ─────────────────────────────────────────────
+// Prezzo singolo
 app.get('/api/price/:id', async (req, res) => {
-  const futbinId = req.params.id;
+  const id = req.params.id;
 
-  // 1. Cache fresca?
-  const cached = cacheGet(priceCache, futbinId);
-  if (cached && !cached.stale) {
-    return res.json(cached.data);
-  }
+  const cached = cacheGet(priceCache, id);
+  if (cached && !cached.stale) return res.json(cached.data);
 
-  // 2. Rate limit
-  if (!rateLimitCheck(res)) return;
+  if (!checkRate(res)) return;
 
-  // 3. Fetch da FUTBIN
   try {
-    const data = await fetchPriceFromFutbin(futbinId);
-    cacheSet(priceCache, futbinId, data);
+    const data = await fetchPriceFromFutbin(id);
+    cacheSet(priceCache, id, data);
     return res.json(data);
   } catch (err) {
     console.error(`[price] ${err.message}`);
-    // 4. Fallback su cache stale
-    if (cached) {
-      return res.json({ ...cached.data, stale: true });
-    }
+    if (cached) return res.json({ ...cached.data, stale: true });
     return res.status(502).json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────
-// ENDPOINT: POST /api/prices/batch
-// Body: { "ids": ["158023", "231747", ...] }
-// Ritorna: { "158023": { ps, xbox, pc, ... }, ... }
-// ─────────────────────────────────────────────
+// Batch prezzi
 app.post('/api/prices/batch', async (req, res) => {
   const { ids } = req.body;
-
   if (!Array.isArray(ids) || ids.length === 0) {
-    return res.status(400).json({ error: 'Serve un array "ids" nel body' });
+    return res.status(400).json({ error: 'Serve array "ids"' });
   }
 
-  // Limita a 100 per richiesta
   const toFetch = ids.slice(0, 100);
   const results = {};
 
-  // 1. Prendi dalla cache quello che c'è
   const uncached = [];
   for (const id of toFetch) {
     const cached = cacheGet(priceCache, String(id));
@@ -187,15 +257,13 @@ app.post('/api/prices/batch', async (req, res) => {
     }
   }
 
-  // 2. Fetch i mancanti in chunk da 5
   const CHUNK = 5;
   for (let i = 0; i < uncached.length; i += CHUNK) {
     const chunk = uncached.slice(i, i + CHUNK);
 
     await Promise.all(
       chunk.map(async (id) => {
-        if (requestsThisMinute >= MAX_REQUESTS_PER_MINUTE) {
-          // Rate limited — usa stale se c'è
+        if (requestsThisMinute >= MAX_RPM) {
           const stale = cacheGet(priceCache, id);
           if (stale) results[id] = { ...stale.data, stale: true };
           return;
@@ -208,14 +276,12 @@ app.post('/api/prices/batch', async (req, res) => {
           results[id] = data;
         } catch (err) {
           console.error(`[batch] ${id}: ${err.message}`);
-          // Fallback stale
           const stale = cacheGet(priceCache, id);
           if (stale) results[id] = { ...stale.data, stale: true };
         }
       })
     );
 
-    // Pausa tra chunk per non triggerare il rate limit di FUTBIN
     if (i + CHUNK < uncached.length) {
       await new Promise((r) => setTimeout(r, 400));
     }
@@ -224,44 +290,26 @@ app.post('/api/prices/batch', async (req, res) => {
   res.json(results);
 });
 
-// ─────────────────────────────────────────────
-// ENDPOINT: GET /api/search?name=NOME
-// Cerca giocatore su FUTBIN e ritorna ID
-// ─────────────────────────────────────────────
+// Cerca giocatore per nome
 app.get('/api/search', async (req, res) => {
   const name = (req.query.name || '').toString().trim();
-
-  if (!name) {
-    return res.status(400).json({ error: 'Parametro "name" richiesto' });
-  }
+  if (!name) return res.status(400).json({ error: 'Parametro "name" richiesto' });
 
   const nameLower = name.toLowerCase();
-
-  // 1. Cache
   const cached = cacheGet(searchCache, nameLower);
-  if (cached && !cached.stale) {
-    return res.json(cached.data);
-  }
+  if (cached && !cached.stale) return res.json(cached.data);
 
-  // 2. Rate limit
-  if (!rateLimitCheck(res)) return;
+  if (!checkRate(res)) return;
 
-  // 3. Fetch da FUTBIN
   try {
     const url = `${FUTBIN_PLAYERS_URL}?search=${encodeURIComponent(name)}`;
-    const response = await fetch(url, {
-      headers: BROWSER_HEADERS,
-      timeout: 12000,
-    });
+    const response = await futbinFetch(url);
 
-    if (!response.ok) {
-      throw new Error(`FUTBIN search ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`FUTBIN search ${response.status}`);
 
     const text = await response.text();
-
-    // FUTBIN può rispondere JSON o HTML
     let players = [];
+
     try {
       const json = JSON.parse(text);
       if (Array.isArray(json)) {
@@ -275,32 +323,14 @@ app.get('/api/search', async (req, res) => {
         }));
       }
     } catch {
-      // Prova parsing HTML per estrarre ID
-      const regex = /\/26\/player\/(\d+)\/([^"]+)/g;
+      const regex = /\/(?:25|26)\/player\/(\d+)\/([^"]+)/g;
       let match;
       while ((match = regex.exec(text)) !== null) {
         players.push({
           id: match[1],
           name: match[2].replace(/-/g, ' '),
-          rating: 0,
-          position: '',
-          club: '',
-          nation: '',
+          rating: 0, position: '', club: '', nation: '',
         });
-      }
-      // Fallback regex per /25/
-      if (players.length === 0) {
-        const regex25 = /\/25\/player\/(\d+)\/([^"]+)/g;
-        while ((match = regex25.exec(text)) !== null) {
-          players.push({
-            id: match[1],
-            name: match[2].replace(/-/g, ' '),
-            rating: 0,
-            position: '',
-            club: '',
-            nation: '',
-          });
-        }
       }
     }
 
@@ -309,17 +339,12 @@ app.get('/api/search', async (req, res) => {
     return res.json(result);
   } catch (err) {
     console.error(`[search] ${err.message}`);
-    if (cached) {
-      return res.json({ ...cached.data, stale: true });
-    }
+    if (cached) return res.json({ ...cached.data, stale: true });
     return res.status(502).json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────
-// ENDPOINT: GET /api/players?page=1&sort=Overall&order=desc
-// Lista giocatori FUTBIN per costruire mappa nome→ID
-// ─────────────────────────────────────────────
+// Lista giocatori per pagina
 app.get('/api/players', async (req, res) => {
   const page = req.query.page || 1;
   const sort = req.query.sort || 'Overall';
@@ -327,26 +352,19 @@ app.get('/api/players', async (req, res) => {
 
   const cacheKey = `players_${page}_${sort}_${order}`;
   const cached = cacheGet(searchCache, cacheKey);
-  if (cached && !cached.stale) {
-    return res.json(cached.data);
-  }
+  if (cached && !cached.stale) return res.json(cached.data);
 
-  if (!rateLimitCheck(res)) return;
+  if (!checkRate(res)) return;
 
   try {
     const url = `${FUTBIN_PLAYERS_URL}?page=${page}&sort=${sort}&order=${order}&version=all_versions`;
-    const response = await fetch(url, {
-      headers: BROWSER_HEADERS,
-      timeout: 12000,
-    });
+    const response = await futbinFetch(url);
 
-    if (!response.ok) {
-      throw new Error(`FUTBIN players page ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`FUTBIN players ${response.status}`);
 
     const text = await response.text();
-
     let players = [];
+
     try {
       const json = JSON.parse(text);
       if (Array.isArray(json)) {
@@ -360,17 +378,13 @@ app.get('/api/players', async (req, res) => {
         }));
       }
     } catch {
-      // HTML fallback
       const regex = /\/(?:25|26)\/player\/(\d+)\/([^"]+)/g;
       let match;
       while ((match = regex.exec(text)) !== null) {
         players.push({
           id: match[1],
           name: match[2].replace(/-/g, ' '),
-          rating: 0,
-          position: '',
-          club: '',
-          nation: '',
+          rating: 0, position: '', club: '', nation: '',
         });
       }
     }
@@ -379,24 +393,21 @@ app.get('/api/players', async (req, res) => {
     return res.json(players);
   } catch (err) {
     console.error(`[players] ${err.message}`);
-    if (cached) {
-      return res.json(cached.data);
-    }
+    if (cached) return res.json(cached.data);
     return res.status(502).json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────
-// CATCH-ALL
-// ─────────────────────────────────────────────
+// Root info
 app.get('/', (_req, res) => {
   res.json({
     name: 'FC26 Market Proxy',
-    version: '1.0.0',
+    version: '1.1.0',
+    session: sessionReady,
     endpoints: {
       health: 'GET /api/health',
       price: 'GET /api/price/:futbinId',
-      batch: 'POST /api/prices/batch  body: { ids: ["158023", ...] }',
+      batch: 'POST /api/prices/batch { ids: [...] }',
       search: 'GET /api/search?name=Mbappé',
       players: 'GET /api/players?page=1&sort=Overall&order=desc',
     },
@@ -404,21 +415,25 @@ app.get('/', (_req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// START
+// START — inizializza sessione poi avvia server
 // ─────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log('');
-  console.log('╔══════════════════════════════════════════════╗');
-  console.log('║   FC26 Market Proxy — FUTBIN Price Server    ║');
-  console.log('╠══════════════════════════════════════════════╣');
-  console.log(`║  Porta: ${PORT}                                  ║`);
-  console.log('║                                              ║');
-  console.log('║  Endpoints:                                  ║');
-  console.log('║  GET  /api/health                            ║');
-  console.log('║  GET  /api/price/:id                         ║');
-  console.log('║  POST /api/prices/batch                      ║');
-  console.log('║  GET  /api/search?name=...                   ║');
-  console.log('║  GET  /api/players?page=1                    ║');
-  console.log('╚══════════════════════════════════════════════╝');
-  console.log('');
-});
+(async () => {
+  await initSession();
+
+  app.listen(PORT, () => {
+    console.log('');
+    console.log('╔══════════════════════════════════════════════╗');
+    console.log('║   FC26 Market Proxy v1.1 — Cookie + UA Rot   ║');
+    console.log('╠══════════════════════════════════════════════╣');
+    console.log(`║  Porta:    ${String(PORT).padEnd(33)}║`);
+    console.log(`║  Sessione: ${(sessionReady ? '✅ Attiva' : '❌ Fallita').padEnd(33)}║`);
+    console.log('║                                              ║');
+    console.log('║  GET  /api/health                            ║');
+    console.log('║  GET  /api/price/:id                         ║');
+    console.log('║  POST /api/prices/batch                      ║');
+    console.log('║  GET  /api/search?name=...                   ║');
+    console.log('║  GET  /api/players?page=1                    ║');
+    console.log('╚══════════════════════════════════════════════╝');
+    console.log('');
+  });
+})();
